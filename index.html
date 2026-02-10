@@ -15,7 +15,6 @@
 
         // --- 1. Firebase Configuration & Init ---
         const firebaseConfig = JSON.parse(localStorage.getItem('firebase_config_override') || JSON.stringify(window.__firebase_config || {}));
-        // Fallback placeholder if environment variable is missing (for preview safety)
         if (!window.__firebase_config) {
              console.warn("Firebase config not found in environment. App may not save data.");
         }
@@ -29,197 +28,233 @@
         let currentUserProfile = null; // { name: '', role: '' }
         let currentUserId = null;
 
-        // --- 2. Auth Logic ---
-        const loginModal = document.getElementById('loginModal');
-        const appContent = document.getElementById('appContent');
-        const userDisplay = document.getElementById('userDisplay');
-        const loginForm = document.getElementById('loginForm');
+        // Utility: profile storage (local + Firestore)
+        const PROFILES_KEY = 'sop_user_profiles_v1';
+        function loadProfiles() {
+            try { return JSON.parse(localStorage.getItem(PROFILES_KEY) || '{}'); } catch { return {}; }
+        }
+        function saveProfileForUid(uid, profile) {
+            // save locally
+            const all = loadProfiles();
+            all[uid] = profile;
+            localStorage.setItem(PROFILES_KEY, JSON.stringify(all));
+            // also save to Firestore (best-effort)
+            if (uid && db) saveProfileToFirestore(uid, profile).catch(e => console.warn('Firestore save profile failed', e));
+        }
+        function getProfileForUid(uid) {
+            return loadProfiles()[uid] || null;
+        }
 
-        // Initial Auth Check
-        const initAuth = async () => {
-             // Sign in anonymously to get a UID for security rules
-             await signInAnonymously(auth);
-        };
-        initAuth();
+        // Remote profiles cache
+        let remoteProfiles = {}; // { uid: {name, role, updated} }
 
-        onAuthStateChanged(auth, (user) => {
-            if (user) {
-                currentUserId = user.uid;
-                // Check if we have session profile, if not show login modal
-                if (!currentUserProfile) {
-                    loginModal.classList.remove('hidden');
-                    appContent.classList.add('blur-sm', 'pointer-events-none');
+        // Firestore helpers for profiles
+        async function saveProfileToFirestore(uid, profile) {
+            if (!uid) throw new Error('No uid');
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'private', 'users', uid);
+                await setDoc(docRef, { name: profile.name, role: profile.role, updated: serverTimestamp() }, { merge: true });
+            } catch (e) { throw e; }
+        }
+
+        function fetchProfilesFromFirestore() {
+            try {
+                const colRef = collection(db, 'artifacts', appId, 'private', 'users');
+                onSnapshot(colRef, (snapshot) => {
+                    const map = {};
+                    snapshot.forEach(d => { map[d.id] = { ...(d.data() || {}) }; });
+                    remoteProfiles = map;
+                    populateSavedProfilesSelect();
+                }, (err) => { console.warn('Error listening profiles:', err); });
+            } catch (e) { console.warn('fetchProfilesFromFirestore error', e); }
+        }
+
+        // Run UI and auth init after DOM ready to ensure elements exist
+        window.addEventListener('DOMContentLoaded', () => {
+            const loginModal = document.getElementById('loginModal');
+            const appContent = document.getElementById('appContent');
+            const loginForm = document.getElementById('loginForm');
+            const savedProfilesSelect = document.getElementById('savedProfilesSelect');
+
+            // Initial Auth: sign in anonymously to obtain a stable UID for this browser
+            const initAuth = async () => {
+                try { await signInAnonymously(auth); } catch (e) { console.warn('Auth init failed', e); }
+            };
+            initAuth();
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    currentUserId = user.uid;
+                    const existing = getProfileForUid(currentUserId);
+                    if (existing) {
+                        applyProfile(existing);
+                        setupRealtimeListeners();
+                    } else {
+                        // show login modal to pick/create profile
+                        openLoginModal();
+                    }
+                    populateSavedProfilesSelect();
+                    // start listening to remote profiles for multi-user sync
+                    fetchProfilesFromFirestore();
                 }
-            }
-        });
+            });
 
-        // Handle Login Submission
-        window.handleLoginSubmit = (e) => {
-            e.preventDefault();
-            const name = document.getElementById('loginName').value;
-            const role = document.getElementById('loginRole').value;
-
-            if (name && role) {
-                currentUserProfile = { name, role };
-                
-                // UI Updates
+            // Show/hide modal helpers
+            window.openLoginModal = () => {
+                populateSavedProfilesSelect();
+                loginModal.classList.remove('hidden');
+                appContent.classList.add('blur-sm', 'pointer-events-none');
+            };
+            window.closeLoginModal = () => {
                 loginModal.classList.add('hidden');
                 appContent.classList.remove('blur-sm', 'pointer-events-none');
-                
-                document.getElementById('displayNama').innerText = name;
-                document.getElementById('displayRole').innerText = role === 'manager' ? 'Manager' : 'Terapis';
-                
-                // Show toast
-                showToast(`Selamat datang, ${name}!`);
+            };
 
-                // Start Listeners
-                setupRealtimeListeners();
+            // Populate saved profiles dropdown (for multi-user switch)
+            function populateSavedProfilesSelect() {
+                const local = loadProfiles();
+                if (!savedProfilesSelect) return;
+                savedProfilesSelect.innerHTML = '<option value="">-- Pilih Profil Tersimpan --</option>';
+
+                // Merge remoteProfiles first (so latest from server shows)
+                Object.keys(remoteProfiles).forEach(uid => {
+                    const p = remoteProfiles[uid];
+                    const opt = document.createElement('option');
+                    opt.value = uid;
+                    opt.text = `${p.name || 'User'} (${p.role || 'unknown'})`;
+                    savedProfilesSelect.appendChild(opt);
+                });
+
+                // Then add any local-only profiles
+                Object.keys(local).forEach(uid => {
+                    if (remoteProfiles[uid]) return; // already listed
+                    const p = local[uid];
+                    const opt = document.createElement('option');
+                    opt.value = uid;
+                    opt.text = `${p.name} (${p.role})`;
+                    savedProfilesSelect.appendChild(opt);
+                });
             }
-        };
 
-        // --- 3. Firestore Logic (Real-time) ---
+            // When selecting a saved profile, autofill fields (prefer remote)
+            if (savedProfilesSelect) {
+                savedProfilesSelect.addEventListener('change', (ev) => {
+                    const uid = ev.target.value;
+                    if (!uid) return;
+                    const p = remoteProfiles[uid] || getProfileForUid(uid);
+                    if (p) {
+                        document.getElementById('loginName').value = p.name || '';
+                        document.getElementById('loginRole').value = p.role || 'terapis';
+                    }
+                });
+            }
 
-        // Helper: Get Today's Date ID (YYYY-MM-DD) for Daily Ops
+            // Handle Login Submission
+            window.handleLoginSubmit = (e) => {
+                e.preventDefault();
+                const name = document.getElementById('loginName').value.trim();
+                const role = document.getElementById('loginRole').value;
+
+                if (!name || !role) return showToast('Isi nama dan peran', true);
+
+                currentUserProfile = { name, role };
+                if (currentUserId) saveProfileForUid(currentUserId, currentUserProfile);
+
+                applyProfile(currentUserProfile);
+                closeLoginModal();
+                showToast(`Selamat datang, ${name}!`);
+                setupRealtimeListeners();
+            };
+
+            // Allow logout (clears current profile for this UID only)
+            window.handleLogout = () => {
+                if (!currentUserId) return;
+                const all = loadProfiles();
+                delete all[currentUserId];
+                localStorage.setItem(PROFILES_KEY, JSON.stringify(all));
+                currentUserProfile = null;
+                document.getElementById('displayNama').innerText = 'Tamu';
+                document.getElementById('displayRole').innerText = 'Silakan Login';
+                openLoginModal();
+                showToast('Anda telah keluar');
+            };
+
+            function applyProfile(profile) {
+                currentUserProfile = profile;
+                document.getElementById('displayNama').innerText = profile.name;
+                document.getElementById('displayRole').innerText = profile.role === 'manager' ? 'Manager' : 'Terapis';
+                // Toggle finance section visibility
+                if (profile.role === 'manager') document.getElementById('financeHistorySection').classList.remove('hidden');
+                else document.getElementById('financeHistorySection').classList.add('hidden');
+            }
+
+            // Expose helper to populate saved profiles on load
+            populateSavedProfilesSelect();
+        });
+
+        // --- Helper functions usable after DOM load ---
         const getTodayId = () => {
             const today = new Date();
             return today.toISOString().split('T')[0];
         };
 
-        function setupRealtimeListeners() {
-            if (!currentUserId) return;
-
+        async function setupRealtimeListeners() {
+            if (!currentUserId || !currentUserProfile) return;
             const todayId = getTodayId();
-            
-            // A. LISTENER: Daily Operational Checklist
-            // Path: artifacts/{appId}/public/data/daily_ops/{date}
             const opsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'daily_ops', todayId);
 
             onSnapshot(opsDocRef, (docSnap) => {
-                if (docSnap.exists()) {
-                    const data = docSnap.data();
-                    updateChecklistUI(data);
-                } else {
-                    // Initialize if empty
-                    updateChecklistUI({}); 
-                }
-            }, (error) => {
-                console.error("Error watching ops:", error);
-            });
+                if (docSnap.exists()) updateChecklistUI(docSnap.data()); else updateChecklistUI({});
+            }, (error) => console.error('Error watching ops:', error));
 
-            // B. LISTENER: Finance Reports (Only if Manager)
-            // Path: artifacts/{appId}/public/data/finance_reports
             if (currentUserProfile.role === 'manager') {
                 const financeColRef = collection(db, 'artifacts', appId, 'public', 'data', 'finance_reports');
-                // Note: Simple query, sorting done in JS as per rules
                 onSnapshot(financeColRef, (snapshot) => {
                     const reports = [];
-                    snapshot.forEach(doc => {
-                        reports.push({ id: doc.id, ...doc.data() });
-                    });
-                    // Client-side sort by timestamp desc
+                    snapshot.forEach(doc => reports.push({ id: doc.id, ...doc.data() }));
                     reports.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0));
                     renderFinanceHistory(reports);
-                }, (error) => console.error("Error watching finance:", error));
-                
-                // Show History Section
-                document.getElementById('financeHistorySection').classList.remove('hidden');
+                }, (error) => console.error('Error watching finance:', error));
             }
         }
 
-        // --- 4. Interactive Functions (Exposed to Window) ---
-
-        // A. Update Checklist Item
         window.toggleChecklistItem = async (itemId, isChecked) => {
             if (!currentUserId || !currentUserProfile) return;
-
             const todayId = getTodayId();
             const opsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'daily_ops', todayId);
-
-            // Construct update object
-            // field format: "item_id": { checked: boolean, by: string, time: string }
             const updateData = {};
-            updateData[itemId] = {
-                checked: isChecked,
-                by: currentUserProfile.name,
-                time: new Date().toLocaleTimeString()
-            };
-
-            // Use setDoc with merge: true to create if doesn't exist
-            try {
-                await setDoc(opsDocRef, updateData, { merge: true });
-                // UI will update via onSnapshot
-            } catch (e) {
-                console.error("Error updating checklist:", e);
-                showToast("Gagal menyimpan data", true);
-            }
+            updateData[itemId] = { checked: isChecked, by: currentUserProfile.name, time: new Date().toLocaleTimeString() };
+            try { await setDoc(opsDocRef, updateData, { merge: true }); } catch (e) { console.error('Error updating checklist:', e); showToast('Gagal menyimpan data', true); }
         };
 
-        // B. Save Finance Report
         window.saveFinanceReport = async () => {
             if (!currentUserId || !currentUserProfile) return;
-
             const omzet = document.getElementById('inputOmzet').value;
             const profitText = document.getElementById('resultProfit').innerText;
-            const profitValue = parseFloat(profitText.replace(/[^0-9,-]+/g,"").replace(",",".")); // Simple parser
-
-            const reportData = {
-                date: new Date().toLocaleDateString(),
-                timestamp: serverTimestamp(),
-                omzet: omzet,
-                profit_display: profitText,
-                saved_by: currentUserProfile.name,
-                note: "Laporan Harian"
-            };
-
-            try {
-                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'finance_reports'), reportData);
-                showToast("Laporan Keuangan Tersimpan!");
-            } catch (e) {
-                console.error("Error saving finance:", e);
-                showToast("Gagal menyimpan laporan", true);
-            }
+            const reportData = { date: new Date().toLocaleDateString(), timestamp: serverTimestamp(), omzet: omzet, profit_display: profitText, saved_by: currentUserProfile.name, note: 'Laporan Harian' };
+            try { await addDoc(collection(db, appId, 'public', 'data', 'finance_reports'), reportData); showToast('Laporan Keuangan Tersimpan!'); } catch (e) { console.error('Error saving finance:', e); showToast('Gagal menyimpan laporan', true); }
         };
-
-        // --- 5. UI Helpers ---
 
         function updateChecklistUI(data) {
             const checkboxes = document.querySelectorAll('.ops-checkbox');
             checkboxes.forEach(cb => {
                 const itemId = cb.dataset.id;
                 const itemData = data[itemId];
-                
-                // Update checked state
                 cb.checked = itemData?.checked || false;
-                
-                // Update "Checked By" label
                 const labelSpan = document.getElementById(`label-${itemId}`);
-                if (itemData?.checked) {
-                    labelSpan.innerHTML = `<span class="text-xs text-emerald-600 font-bold ml-2">✓ ${itemData.by} (${itemData.time})</span>`;
-                } else {
-                    labelSpan.innerHTML = '';
-                }
+                if (itemData?.checked) labelSpan.innerHTML = `<span class="text-xs text-emerald-600 font-bold ml-2">✓ ${itemData.by} (${itemData.time})</span>`; else labelSpan.innerHTML = '';
             });
         }
 
         function renderFinanceHistory(reports) {
             const container = document.getElementById('financeHistoryList');
+            if (!container) return;
             container.innerHTML = '';
-            
-            if (reports.length === 0) {
-                container.innerHTML = '<div class="text-stone-400 text-sm italic">Belum ada laporan tersimpan.</div>';
-                return;
-            }
-
-            reports.slice(0, 5).forEach(report => { // Show last 5
+            if (reports.length === 0) { container.innerHTML = '<div class="text-stone-400 text-sm italic">Belum ada laporan tersimpan.</div>'; return; }
+            reports.slice(0, 5).forEach(report => {
                 const div = document.createElement('div');
-                div.className = "flex justify-between items-center p-3 bg-stone-50 rounded border border-stone-200 text-sm";
-                div.innerHTML = `
-                    <div>
-                        <div class="font-bold text-stone-700">${report.date}</div>
-                        <div class="text-xs text-stone-500">Oleh: ${report.saved_by}</div>
-                    </div>
-                    <div class="font-bold text-emerald-600">${report.profit_display}</div>
-                `;
+                div.className = 'flex justify-between items-center p-3 bg-stone-50 rounded border border-stone-200 text-sm';
+                div.innerHTML = `<div><div class="font-bold text-stone-700">${report.date}</div><div class="text-xs text-stone-500">Oleh: ${report.saved_by}</div></div><div class="font-bold text-emerald-600">${report.profit_display}</div>`;
                 container.appendChild(div);
             });
         }
@@ -229,10 +264,7 @@
             toast.innerText = msg;
             toast.className = `fixed bottom-4 right-4 px-6 py-3 rounded-lg shadow-lg text-white transform transition-all duration-300 z-50 ${isError ? 'bg-red-600' : 'bg-emerald-600'}`;
             toast.classList.remove('translate-y-20', 'opacity-0');
-            
-            setTimeout(() => {
-                toast.classList.add('translate-y-20', 'opacity-0');
-            }, 3000);
+            setTimeout(() => { toast.classList.add('translate-y-20', 'opacity-0'); }, 3000);
         };
 
     </script>
@@ -264,6 +296,12 @@
             </div>
             <form id="loginForm" onsubmit="handleLoginSubmit(event)">
                 <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-bold text-stone-700 mb-1">Pilih Profil Tersimpan (opsional)</label>
+                        <select id="savedProfilesSelect" class="w-full p-3 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:outline-none">
+                            <option value="">-- Tidak memilih --</option>
+                        </select>
+                    </div>
                     <div>
                         <label class="block text-sm font-bold text-stone-700 mb-1">Nama Anda</label>
                         <input type="text" id="loginName" required placeholder="Contoh: Ahmad" class="w-full p-3 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:outline-none">
@@ -298,6 +336,10 @@
                     <div class="text-xs">
                         <div class="font-bold text-emerald-800" id="displayNama">Tamu</div>
                         <div class="text-emerald-600" id="displayRole">Silakan Login</div>
+                    </div>
+                    <div class="ml-auto flex items-center gap-2">
+                        <button onclick="openLoginModal()" class="text-xs text-emerald-700 bg-emerald-100 px-2 py-1 rounded">Ganti User</button>
+                        <button onclick="handleLogout()" class="text-xs text-stone-500 bg-stone-100 px-2 py-1 rounded">Keluar</button>
                     </div>
                 </div>
             </div>
